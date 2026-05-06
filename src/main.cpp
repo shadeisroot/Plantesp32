@@ -22,7 +22,7 @@ char unique_identifier[] = "sunfounder-client-easvfaetter";
 const int mqtt_port      = 1883;
 
 WiFiClient        espClient;
-PubSubClient      client;          // no arg — set via setClient() in setup
+PubSubClient      client;
 HardwareSerial    ModbusSerial(1);
 ModbusMaster      node;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -46,21 +46,25 @@ bool initLCD() {
 }
 
 void reconnect() {
-  while (!client.connected()) {
-    if (client.connect(unique_identifier)) {
-      Serial.println("MQTT connected");
-    } else {
-      Serial.print("MQTT failed, rc=");
-      Serial.println(client.state());
-      delay(5000);
-    }
+  if (client.connected()) return;
+
+  static unsigned long lastAttempt = 0;
+  if (millis() - lastAttempt < 5000) return;
+  lastAttempt = millis();
+
+  Serial.print("MQTT reconnecting...");
+  if (client.connect(unique_identifier)) {
+    Serial.println("connected");
+  } else {
+    Serial.printf("failed, rc=%d, retrying in 5s\n", client.state());
   }
 }
-void runPump() {
 
+void runPump() {
   if (!client.connected()) reconnect();
   client.loop();
   client.publish("esp32/jepstein/pump", "ON");
+
   digitalWrite(waterstream_pin, HIGH);
   delay(5000);
   digitalWrite(waterstream_pin, LOW);
@@ -72,12 +76,35 @@ void setup_wifi() {
   Serial.print("Connecting to ");
   Serial.println(ssid);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected");
-  Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi failed on boot, continuing anyway...");
+  }
+}
+
+void checkWifi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost, reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi reconnected");
+    } else {
+      Serial.println("\nWiFi reconnect failed, will retry next loop");
+    }
+  }
 }
 
 void checkMoisture() {
@@ -97,14 +124,12 @@ void setup() {
   Serial.begin(115200);
   setup_wifi();
 
-  // Fix: bind transport before setServer
   client.setClient(espClient);
   client.setServer(mqtt_server, mqtt_port);
 
   pinMode(waterstream_pin, OUTPUT);
   digitalWrite(waterstream_pin, LOW);
 
-  // MAX485 power — must come before Modbus init
   pinMode(MAX485_POWER_PIN, OUTPUT);
   digitalWrite(MAX485_POWER_PIN, LOW);
   delay(2000);
@@ -114,13 +139,11 @@ void setup() {
   pinMode(DE_RE_PIN, OUTPUT);
   digitalWrite(DE_RE_PIN, LOW);
 
-  // Modbus init
   ModbusSerial.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
   node.begin(1, ModbusSerial);
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
 
-  // LCD
   Serial.println("Waiting for LCD...");
   while (!lcdReady) {
     lcdReady = initLCD();
@@ -131,12 +154,18 @@ void setup() {
   }
   Serial.println("LCD ready!");
 
+  if (!client.connected()) {
+    client.connect(unique_identifier);
+    delay(500);
+  }
+
   checkMoisture();
   lastMoistureCheck = millis();
 }
 
 void loop() {
-  if (!client.connected()) reconnect();
+  checkWifi();
+  reconnect();
   client.loop();
 
   uint8_t result = node.readHoldingRegisters(0x0000, 4);
@@ -154,18 +183,18 @@ void loop() {
       checkMoisture();
     }
 
-    // Update LCD
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("M:"); lcd.print(moisture, 1); lcd.print("% T:"); lcd.print(temp, 1); lcd.print("C");
     lcd.setCursor(0, 1);
     lcd.print("EC:"); lcd.print(ec); lcd.print(" pH:"); lcd.print(ph, 1);
 
-    // Publish to MQTT
-    char payload[100];
-    sprintf(payload, "{\"moisture\":%.1f,\"temp\":%.1f,\"ec\":%d,\"ph\":%.1f}",
-            moisture, temp, ec, ph);
-    client.publish("esp32/jepstein/readings", payload);
+    if (client.connected()) {
+      char payload[100];
+      sprintf(payload, "{\"moisture\":%.1f,\"temp\":%.1f,\"ec\":%d,\"ph\":%.1f}",
+              moisture, temp, ec, ph);
+      client.publish("esp32/jepstein/readings", payload);
+    }
 
   } else {
     Serial.printf("Modbus error: 0x%02X\n", result);
